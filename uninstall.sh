@@ -36,8 +36,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Docker commands need different approaches for read vs write
 exec_cmd() {
     if $LOCAL_MODE; then eval "$@"; else docker exec "$CONTAINER" sh -c "$*"; fi
+}
+# Use docker cp for file operations (runs as root, avoids permission issues)
+copy_within() {
+    local src="$1" dst="$2"
+    if $LOCAL_MODE; then
+        cp "$src" "$dst"
+    else
+        local tmp_dir=$(mktemp -d)
+        docker cp "${CONTAINER}:${src}" "${tmp_dir}/file"
+        docker cp "${tmp_dir}/file" "${CONTAINER}:${dst}"
+        rm -rf "$tmp_dir"
+    fi
 }
 
 # ── Find backup ─────────────────────────────────────────────────────────────
@@ -52,18 +65,33 @@ ok "Found backup: ${BACKUP_NAME} -> ${ORIGINAL_NAME}"
 
 # ── Restore original bundle ─────────────────────────────────────────────────
 info "Restoring original bundle..."
-exec_cmd "cp '${BACKUP_FILE}' '${BUNDLE_DIR}/${ORIGINAL_NAME}'"
+copy_within "$BACKUP_FILE" "${BUNDLE_DIR}/${ORIGINAL_NAME}"
 ok "Restored: ${ORIGINAL_NAME}"
 
 # ── Update index.html ───────────────────────────────────────────────────────
 info "Updating index.html..."
 CACHE_BUSTER="v=$(date +%s)"
-exec_cmd "sed -i -E 's|src=\"\./assets/index-[^\"]+\"|src=\"./assets/${ORIGINAL_NAME}?${CACHE_BUSTER}\"|' '${INDEX_HTML}'"
+
+if $LOCAL_MODE; then
+    sed -i -E "s|src=\"\./assets/index-[^\"]+\"|src=\"./assets/${ORIGINAL_NAME}?${CACHE_BUSTER}\"|" "$INDEX_HTML"
+else
+    # Pull index.html, modify locally, push back (avoids permission issues)
+    tmp_html=$(mktemp)
+    docker cp "${CONTAINER}:${INDEX_HTML}" "$tmp_html"
+    sed -i -E "s|src=\"\./assets/index-[^\"]+\"|src=\"./assets/${ORIGINAL_NAME}?${CACHE_BUSTER}\"|" "$tmp_html"
+    docker cp "$tmp_html" "${CONTAINER}:${INDEX_HTML}"
+    rm -f "$tmp_html"
+fi
 ok "index.html restored"
 
 # ── Remove patched bundle ───────────────────────────────────────────────────
 info "Removing patched bundle..."
-exec_cmd "rm -f '${BUNDLE_DIR}/index-LINKIFIER.js'"
+if $LOCAL_MODE; then
+    rm -f "${BUNDLE_DIR}/index-LINKIFIER.js"
+else
+    # docker exec as root to remove
+    docker exec -u root "$CONTAINER" rm -f "${BUNDLE_DIR}/index-LINKIFIER.js"
+fi
 ok "Removed: index-LINKIFIER.js"
 
 # ── Done ────────────────────────────────────────────────────────────────────

@@ -136,13 +136,14 @@ if [[ -n "$CUSTOM_REGEX" ]]; then
     JS_REGEX="$CUSTOM_REGEX"
 else
     # Escape special regex chars in the pattern prefix, then add character class for continuation
+    # Forward slashes MUST be escaped as \/ for JS regex literals
     ESCAPED_PATTERN=$(python3 -c "
 import re, sys
 p = sys.argv[1]
-escaped = re.escape(p).replace('\\\\/', '/')
+escaped = re.escape(p).replace('/', '\\\\/')
 print(escaped, end='')
 " "$PATTERN")
-    JS_REGEX="${ESCAPED_PATTERN}[^\\\\s\"'<>)\\\\]\\\\}|,;:]+"
+    JS_REGEX="${ESCAPED_PATTERN}[^\s\"'<>)\]\}|,;:]+"
 fi
 
 # ── Build JS Click Handler ──────────────────────────────────────────────────
@@ -271,7 +272,7 @@ if use_decoration:
     dc += 'if(!mk)continue;'
     dc += 'var d=u.registerDecoration({marker:mk,x:m.index,width:mt.length,layer:"top"});'
     dc += f'if(d){{d.onRender(function(el){{el.style.borderBottom="2px solid {color}";'
-    dc += 'el.style.pointerEvents="none"});ds.push(d)}}'
+    dc += 'el.style.pointerEvents="none"});ds.push(d)}'
     dc += '}if(ds.length>0)_dd[bl]=ds}'
     dc += 'var ks=Object.keys(_dd);for(var j=0;j<ks.length;j++){var k=parseInt(ks[j]);'
     dc += 'if(k<b-200){_dd[k].forEach(function(x){try{x.dispose()}catch(e){}});delete _dd[k]}}'
@@ -322,7 +323,13 @@ BACKUP_NAME="${BUNDLE_NAME}.bak"
 BACKUP_EXISTS=$(exec_cmd "[ -f '${BUNDLE_DIR}/${BACKUP_NAME}' ] && echo yes || echo no")
 
 if [[ "$BACKUP_EXISTS" == "no" ]]; then
-    exec_cmd "cp '${BUNDLE_FILE}' '${BUNDLE_DIR}/${BACKUP_NAME}'"
+    if $LOCAL_MODE; then
+        cp "$BUNDLE_FILE" "${BUNDLE_DIR}/${BACKUP_NAME}"
+    else
+        # Use docker cp to avoid permission issues (copies as root)
+        docker cp "${CONTAINER}:${BUNDLE_FILE}" "${tmp_dir}/backup.js"
+        docker cp "${tmp_dir}/backup.js" "${CONTAINER}:${BUNDLE_DIR}/${BACKUP_NAME}"
+    fi
     ok "Backup created: ${BACKUP_NAME}"
 else
     ok "Backup already exists: ${BACKUP_NAME}"
@@ -337,7 +344,14 @@ ok "Deployed: ${PATCHED_NAME}"
 # ── Step 7: Update index.html ───────────────────────────────────────────────
 info "Updating index.html..."
 CACHE_BUSTER="v=$(date +%s)"
-exec_cmd "sed -i -E 's|src=\"\./assets/index-[^\"]+\"|src=\"./assets/${PATCHED_NAME}?${CACHE_BUSTER}\"|' '${INDEX_HTML}'"
+if $LOCAL_MODE; then
+    sed -i -E "s|src=\"\./assets/index-[^\"]+\"|src=\"./assets/${PATCHED_NAME}?${CACHE_BUSTER}\"|" "$INDEX_HTML"
+else
+    # Pull, modify, push back (avoids permission issues with docker exec)
+    docker cp "${CONTAINER}:${INDEX_HTML}" "${tmp_dir}/index.html"
+    sed -i -E "s|src=\"\./assets/index-[^\"]+\"|src=\"./assets/${PATCHED_NAME}?${CACHE_BUSTER}\"|" "${tmp_dir}/index.html"
+    docker cp "${tmp_dir}/index.html" "${CONTAINER}:${INDEX_HTML}"
+fi
 ok "index.html updated (cache buster: ${CACHE_BUSTER})"
 
 # ── Done ────────────────────────────────────────────────────────────────────
