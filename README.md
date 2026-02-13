@@ -26,12 +26,13 @@ termix-linkifier patches the minified xterm.js bundle inside your Termix install
 
 1. **A custom Link Provider** that detects your text pattern and makes matches clickable
 2. **Persistent Decorations** that draw colored underlines beneath matched text (not just on hover)
+3. **Staleness Detection** that automatically removes decorations when the line content changes
 
 The patch hooks into xterm.js's `WebLinksAddon.activate()` method -- the same code path that makes `http://` URLs clickable. This ensures correct coordinate handling and native terminal rendering.
 
 ### What gets modified
 
-- The main JavaScript bundle (e.g. `assets/index-D97JNeu.js`) is copied to `index-LINKIFIER.js` with the patch applied
+- The main JavaScript bundle (e.g. `assets/index-Ddwdsiux.js`) is copied to `index-LINKIFIER.js` with the patch applied
 - `index.html` is updated to load the patched bundle (with a cache-busting query string)
 - The original bundle is backed up as `*.bak` for easy uninstall
 
@@ -123,6 +124,21 @@ The patch hooks into xterm.js's `WebLinksAddon.activate()` method -- the same co
   --clipboard
 ```
 
+## After a Termix Update
+
+When Termix is updated (e.g. via `docker compose pull && docker compose up -d`), the patched bundle is replaced by the new version. Simply re-run `install.sh` with the same parameters:
+
+```bash
+# Termix update
+cd /path/to/termix && docker compose pull && docker compose up -d
+
+# Re-apply linkifier (auto-detects new bundle)
+./install.sh --container termix --pattern '/opt/shared/' \
+  --url 'http://viewer.example.com/?file={path}'
+```
+
+The installer automatically adapts to different xterm.js bundle versions and minification styles -- no manual adjustments needed.
+
 ## Uninstall
 
 ```bash
@@ -139,7 +155,7 @@ This restores the original bundle from backup and updates `index.html`.
 
 | Component | Tested Version |
 |-----------|---------------|
-| Termix | 1.11.0 |
+| Termix | 1.11.0, 1.12.0+ |
 | xterm.js | 5.x (with WebLinksAddon) |
 | Browser | Chromium-based (Chrome, Brave, Edge) |
 | Python | 3.6+ |
@@ -156,15 +172,20 @@ Should work with any web terminal that uses xterm.js with the `@xterm/addon-web-
 
 ## Technical Details
 
-The patcher finds this specific code pattern in the minified xterm.js bundle:
+The patcher uses a regex to find the WebLinksAddon activation pattern in the minified bundle:
 
 ```
 this._linkProvider=this._terminal.registerLinkProvider(
-  new s.WebLinkProvider(this._terminal,h,this._handler,p)
+  new s.WebLinkProvider(this._terminal,VAR,this._handler,VAR)
 )}dispose
 ```
 
-It injects a custom `registerLinkProvider` call (using xterm.js's native API) and optional `registerDecoration` calls for persistent visual highlighting.
+Where `VAR` matches any single-letter minified variable name. This makes the patcher resilient to different minification outputs across xterm.js versions.
+
+It then injects:
+- A custom `registerLinkProvider` call (using xterm.js's native API)
+- Optional `registerDecoration` calls for persistent visual highlighting
+- Staleness detection that disposes decorations when line content changes
 
 Key technical insights discovered during development:
 
@@ -172,6 +193,8 @@ Key technical insights discovered during development:
 - xterm.js's built-in `WebLinkProvider` validates matches with `new URL()`, so it only works for actual URLs -- custom patterns need a raw link provider
 - `registerMarker(offset)` requires `bufferLine - (baseY + cursorY)` as the offset parameter
 - `WebLinkProvider.computeLink` internally appends the `g` regex flag, so never pass a regex that already has it
+- Forward slashes in regex patterns must be escaped as `\/` inside JavaScript regex literals
+- Docker containers may run as non-root users -- use `docker cp` instead of `docker exec` for file operations
 
 ## License
 
