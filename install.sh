@@ -205,9 +205,11 @@ copy_from "$BUNDLE_FILE" "${tmp_dir}/original.js"
 # ── Step 3: Verify injection point ──────────────────────────────────────────
 info "Verifying xterm.js WebLinksAddon injection point..."
 
-SEARCH_STR='this._linkProvider=this._terminal.registerLinkProvider(new s.WebLinkProvider(this._terminal,h,this._handler,p))}dispose'
+# The injection point has minified variable names that change between versions.
+# Use regex to find it flexibly: this._terminal,VAR,this._handler,VAR
+SEARCH_STR=$(grep -oP 'this\._linkProvider=this\._terminal\.registerLinkProvider\(new s\.WebLinkProvider\(this\._terminal,[a-z],this\._handler,[a-z]\)\)\}dispose' "${tmp_dir}/original.js" | head -1)
 
-if ! grep -qF "$SEARCH_STR" "${tmp_dir}/original.js"; then
+if [[ -z "$SEARCH_STR" ]]; then
     die "Injection point not found in bundle!
   - Is the bundle already patched? Run uninstall.sh first.
   - Is this an xterm.js-based terminal with WebLinksAddon?
@@ -223,6 +225,7 @@ export TL_HANDLER="$JS_HANDLER"
 export TL_COLOR="$COLOR"
 export TL_PATTERN="$PATTERN"
 export TL_DECORATION="$DECORATION"
+export TL_SEARCH="$SEARCH_STR"
 
 python3 - "${tmp_dir}/original.js" "${tmp_dir}/patched.js" <<'PATCHER'
 import sys, os
@@ -234,8 +237,7 @@ color = os.environ["TL_COLOR"]
 pattern_text = os.environ.get("TL_PATTERN", "")
 use_decoration = os.environ.get("TL_DECORATION", "true") == "true"
 
-SEARCH = ('this._linkProvider=this._terminal.registerLinkProvider('
-          'new s.WebLinkProvider(this._terminal,h,this._handler,p))}dispose')
+SEARCH = os.environ["TL_SEARCH"]
 
 # Escape pattern for JS indexOf check
 escaped_check = pattern_text.replace('\\', '\\\\').replace('"', '\\"') if pattern_text else ""
@@ -261,11 +263,16 @@ dc = ''
 if use_decoration:
     dc += 'var _dd={},_df=0;function _ds(){if(_df)return;_df=1;try{'
     dc += 'var r=u.rows,b=u.buffer.active.baseY,cy=u.buffer.active.cursorY,cb=b+cy;'
-    dc += 'for(var i=0;i<r;i++){var bl=b+i;if(_dd[bl])continue;'
+    dc += 'for(var i=0;i<r;i++){var bl=b+i;'
     dc += 'var ln=u.buffer.active.getLine(bl);if(!ln)continue;'
     dc += 'var t=ln.translateToString();'
     if escaped_check:
+        # If cached: check if line STILL contains pattern. If yes, skip. If no, dispose stale decorations.
+        dc += f'if(_dd[bl]){{if(t.indexOf("{escaped_check}")!==-1)continue;'
+        dc += '_dd[bl].forEach(function(x){try{x.dispose()}catch(e){}});delete _dd[bl]}'
         dc += f'if(t.indexOf("{escaped_check}")===-1)continue;'
+    else:
+        dc += 'if(_dd[bl])continue;'
     dc += f'var re=/{js_regex}/g,m,ds=[];'
     dc += 'while((m=re.exec(t))!==null){'
     dc += 'var mt=m[0].replace(/[.]+$/,""),mk=u.registerMarker(bl-cb);'
@@ -285,9 +292,9 @@ lg = f'console.log("[termix-linkifier] Active: {log_text}")'
 
 # ── Assemble & Patch ──
 PATCH = lp + dc + lg
-REPLACE = ('this._linkProvider=this._terminal.registerLinkProvider('
-           'new s.WebLinkProvider(this._terminal,h,this._handler,p));'
-           + PATCH + '}dispose')
+# SEARCH ends with "}dispose", we split there to inject our code before dispose
+inject_point = SEARCH.index('}dispose')
+REPLACE = SEARCH[:inject_point] + ';' + PATCH + '}dispose'
 
 with open(bundle_in, 'r') as f:
     content = f.read()
