@@ -1,33 +1,28 @@
 #!/usr/bin/env bash
 # ============================================================================
-# termix-linkifier v2.0.0
+# termix-linkifier v2.1.0
 # Make any text pattern clickable in Termix / xterm.js terminals
 #
-# v2.0: Uses nginx sub_filter injection instead of bundle patching.
-#       Survives Termix updates — no minified JS is modified.
-#
-# Usage:
-#   ./install.sh --container termix --pattern '/opt/shared/' --clipboard
-#   ./install.sh --container termix --pattern '/opt/shared/' --url 'http://viewer.example.com/?file={path}'
+# v2.1: Uses Docker volume mounts + index.html script injection.
+#       Survives Termix updates (volume-mounted files persist).
 #
 # Public Domain - The Unlicense
 # https://github.com/stlas/termix-linkifier
 # ============================================================================
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 CONTAINER="termix"
-NGINX_CONF="/app/nginx/nginx.conf"
 HTML_DIR="/app/html"
+HOST_DIR=""
 PATTERN=""
 CUSTOM_REGEX=""
 URL_TEMPLATE=""
 USE_CLIPBOARD=false
 COLOR="#4fc3f7"
-DECORATION=true
 DRY_RUN=false
 
 # ── Colors ──────────────────────────────────────────────────────────────────
@@ -41,9 +36,10 @@ die()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 usage() {
     cat <<'USAGE'
-termix-linkifier v2.0.0 - Make text patterns clickable in Termix terminals
+termix-linkifier v2.1.0 - Make text patterns clickable in Termix terminals
 
-v2.0: Uses nginx sub_filter — survives Termix updates!
+Deploys linkifier.js + config via Docker volume mounts.
+Survives Termix updates!
 
 USAGE:
   ./install.sh [OPTIONS]
@@ -58,12 +54,11 @@ CLICK ACTION (pick one):
 
 DOCKER:
   --container NAME      Docker container name (default: termix)
-  --nginx-conf PATH     nginx.conf path inside container (default: /app/nginx/nginx.conf)
   --html-dir PATH       HTML directory inside container (default: /app/html)
+  --host-dir PATH       Directory on host for persistent files (default: /opt/termix-linkifier)
 
 APPEARANCE:
   --color HEX           Highlight color (default: #4fc3f7)
-  --no-decoration       Disable persistent underline (only show on hover)
 
 ADVANCED:
   --regex REGEX         Custom JavaScript regex (instead of auto-generated from --pattern)
@@ -78,10 +73,6 @@ EXAMPLES:
 
   # Copy file paths to clipboard
   ./install.sh --container termix --pattern '/var/log/' --clipboard
-
-  # Match JIRA ticket numbers with orange highlight
-  ./install.sh --container termix --pattern 'JIRA-' \
-    --url 'https://jira.example.com/browse/{path}' --color '#ff9800'
 USAGE
     exit 0
 }
@@ -92,14 +83,13 @@ USAGE
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --container)     CONTAINER="$2"; shift 2 ;;
-        --nginx-conf)    NGINX_CONF="$2"; shift 2 ;;
         --html-dir)      HTML_DIR="$2"; shift 2 ;;
+        --host-dir)      HOST_DIR="$2"; shift 2 ;;
         --pattern)       PATTERN="$2"; shift 2 ;;
         --regex)         CUSTOM_REGEX="$2"; shift 2 ;;
         --url)           URL_TEMPLATE="$2"; shift 2 ;;
         --clipboard)     USE_CLIPBOARD=true; shift ;;
         --color)         COLOR="$2"; shift 2 ;;
-        --no-decoration) DECORATION=false; shift ;;
         --dry-run)       DRY_RUN=true; shift ;;
         --version)       echo "termix-linkifier v${VERSION}"; exit 0 ;;
         --help|-h)       usage ;;
@@ -121,6 +111,7 @@ if [[ -n "$URL_TEMPLATE" ]] && [[ "$URL_TEMPLATE" != *"{path}"* ]]; then
 fi
 
 command -v docker &>/dev/null || die "docker is required"
+command -v python3 &>/dev/null || die "python3 is required"
 
 # ── Build JS Regex ──────────────────────────────────────────────────────────
 if [[ -n "$CUSTOM_REGEX" ]]; then
@@ -132,181 +123,136 @@ p = sys.argv[1]
 escaped = re.escape(p).replace('/', '\\\\/')
 print(escaped, end='')
 " "$PATTERN")
-    JS_REGEX="${ESCAPED_PATTERN}[^\s\"'<>)\]\}|,;:]+"
+    JS_REGEX="${ESCAPED_PATTERN}[^\\\\s\"'<>)\\\\]\\\\}|,;:]+"
 fi
+
+[[ -z "$HOST_DIR" ]] && HOST_DIR="/opt/termix-linkifier"
 
 # ── Display Config ──────────────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}termix-linkifier v${VERSION}${NC} (nginx sub_filter)"
+echo -e "${BOLD}termix-linkifier v${VERSION}${NC}"
 echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "  Method:      ${CYAN}nginx sub_filter (stable!)${NC}"
+echo -e "  Method:      ${CYAN}Docker volume + index.html injection${NC}"
 echo -e "  Pattern:     ${CYAN}${PATTERN:-"(custom regex)"}${NC}"
 echo -e "  Action:      ${CYAN}${URL_TEMPLATE:-"Copy to clipboard"}${NC}"
 echo -e "  Color:       ${CYAN}${COLOR}${NC}"
-echo -e "  Decoration:  ${CYAN}${DECORATION}${NC}"
 echo -e "  Container:   ${CYAN}${CONTAINER}${NC}"
+echo -e "  Host dir:    ${CYAN}${HOST_DIR}${NC}"
 $DRY_RUN && echo -e "  ${YELLOW}DRY RUN — no changes will be made${NC}"
 echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# ── Temp dir ────────────────────────────────────────────────────────────────
-tmp_dir=$(mktemp -d)
-trap 'rm -rf "$tmp_dir"' EXIT
-
-# ── Step 1: Check nginx has sub_filter module ───────────────────────────────
-info "Checking nginx sub_filter module..."
-if docker exec "$CONTAINER" nginx -V 2>&1 | grep -q "http_sub_module"; then
-    ok "nginx has http_sub_module"
-else
-    die "nginx does not have http_sub_module. Cannot inject script."
-fi
-
-# ── Step 2: Check for existing installation ─────────────────────────────────
-info "Checking for existing installation..."
-if docker exec "$CONTAINER" sh -c "grep -q 'termix-linkifier' '${NGINX_CONF}' 2>/dev/null"; then
-    warn "Existing linkifier found in nginx.conf — will be replaced"
-fi
-
-# ── Step 3: Deploy linkifier.js ─────────────────────────────────────────────
-info "Deploying linkifier.js..."
-LINKIFIER_SRC="${SCRIPT_DIR}/linkifier.js"
-[[ -f "$LINKIFIER_SRC" ]] || die "linkifier.js not found in ${SCRIPT_DIR}/"
-
-if ! $DRY_RUN; then
-    docker cp "$LINKIFIER_SRC" "${CONTAINER}:${HTML_DIR}/assets/linkifier.js"
-    ok "Deployed: ${HTML_DIR}/assets/linkifier.js"
-fi
-
-# ── Step 4: Build config file ───────────────────────────────────────────────
-info "Building linkifier-config.js..."
-
-# Escape for JSON
-JS_URL_JSON="null"
-if [[ -n "$URL_TEMPLATE" ]]; then
-    JS_URL_JSON="\"$(echo "$URL_TEMPLATE" | sed 's/"/\\"/g')\""
-fi
-JS_DECO="true"
-[[ "$DECORATION" == false ]] && JS_DECO="false"
-
-# Escape pattern for JS string
-JS_PREFIX=""
-if [[ -n "$PATTERN" ]]; then
-    JS_PREFIX=$(echo "$PATTERN" | sed 's/\\/\\\\/g; s/"/\\"/g')
-fi
-
-# Write config to a separate JS file (avoids nginx quoting issues)
-cat > "${tmp_dir}/linkifier-config.js" <<JSEOF
-window.__LINKIFIER_CONFIG__={regex:"${JS_REGEX}",url:${JS_URL_JSON},prefix:"${JS_PREFIX}",color:"${COLOR}",decoration:${JS_DECO}};
-JSEOF
-
-if ! $DRY_RUN; then
-    docker cp "${tmp_dir}/linkifier-config.js" "${CONTAINER}:${HTML_DIR}/assets/linkifier-config.js"
-    ok "Deployed: ${HTML_DIR}/assets/linkifier-config.js"
-fi
-
-# ── Step 5: Patch nginx.conf ────────────────────────────────────────────────
-info "Patching nginx.conf..."
-
-docker cp "${CONTAINER}:${NGINX_CONF}" "${tmp_dir}/nginx.conf"
-cp "${tmp_dir}/nginx.conf" "${tmp_dir}/nginx.conf.bak"
-
-# Remove any existing linkifier block
-sed -i '/# >>> termix-linkifier/,/# <<< termix-linkifier/d' "${tmp_dir}/nginx.conf"
-
-# sub_filter injects two simple script tags — no special chars that break nginx quoting
-python3 - "${tmp_dir}/nginx.conf" <<'PATCHER'
-import sys
-
-conf_path = sys.argv[1]
-
-with open(conf_path, 'r') as f:
-    content = f.read()
-
-# Find the location / block with try_files ... /index.html
-marker = "try_files $uri $uri/ /index.html;"
-if marker not in content:
-    print("ERROR: Could not find 'try_files $uri $uri/ /index.html;' in nginx.conf", file=sys.stderr)
-    sys.exit(1)
-
-# Only safe ASCII in the sub_filter string — no quotes, angle brackets in values
-injection = """
-        # >>> termix-linkifier v2.0 (DO NOT EDIT — managed by install.sh) >>>
-        sub_filter '</head>' '<script src="./assets/linkifier-config.js"></script><script src="./assets/linkifier.js"></script></head>';
-        sub_filter_once on;
-        # sub_filter_types not needed — text/html is the default
-        # <<< termix-linkifier <<<"""
-
-# Insert after the try_files line
-content = content.replace(marker, marker + injection)
-
-with open(conf_path, 'w') as f:
-    f.write(content)
-
-print("nginx.conf patched successfully")
-PATCHER
-
-if [[ $? -ne 0 ]]; then
-    die "Failed to patch nginx.conf"
-fi
-
 if $DRY_RUN; then
-    echo ""
-    info "DRY RUN — nginx.conf diff:"
-    diff "${tmp_dir}/nginx.conf.bak" "${tmp_dir}/nginx.conf" || true
-    echo ""
     ok "Dry run complete. Remove --dry-run to apply."
     exit 0
 fi
 
-# ── Step 6: Deploy nginx.conf and reload ────────────────────────────────────
-info "Deploying nginx.conf..."
-docker cp "${tmp_dir}/nginx.conf" "${CONTAINER}:${NGINX_CONF}"
-ok "nginx.conf updated"
+# ── Step 1: Create host directory and deploy files ──────────────────────────
+info "Creating host directory ${HOST_DIR}..."
+mkdir -p "$HOST_DIR"
 
-# Backup original nginx.conf (only first time)
-BACKUP_EXISTS=$(docker exec "$CONTAINER" sh -c "[ -f '${NGINX_CONF}.pre-linkifier' ] && echo yes || echo no")
-if [[ "$BACKUP_EXISTS" == "no" ]]; then
-    docker cp "${tmp_dir}/nginx.conf.bak" "${CONTAINER}:${NGINX_CONF}.pre-linkifier"
-    ok "Backup saved: ${NGINX_CONF}.pre-linkifier"
+info "Deploying linkifier.js..."
+LINKIFIER_SRC="${SCRIPT_DIR}/linkifier.js"
+[[ -f "$LINKIFIER_SRC" ]] || die "linkifier.js not found in ${SCRIPT_DIR}/"
+cp "$LINKIFIER_SRC" "${HOST_DIR}/linkifier.js"
+ok "Deployed: ${HOST_DIR}/linkifier.js"
+
+# ── Step 2: Generate linkifier-config.js ────────────────────────────────────
+info "Generating linkifier-config.js..."
+
+python3 -c "
+import sys
+
+regex = sys.argv[1]
+url = sys.argv[2] if sys.argv[2] != 'null' else None
+prefix = sys.argv[3]
+color = sys.argv[4]
+out = sys.argv[5]
+
+# Escape for JS string literals (double-escape backslashes)
+def js_str(s):
+    return s.replace(chr(92), chr(92)+chr(92)).replace('\"', chr(92)+'\"')
+
+parts = []
+parts.append('regex:\"' + js_str(regex) + '\"')
+parts.append('url:' + ('\"' + js_str(url) + '\"' if url else 'null'))
+parts.append('prefix:\"' + js_str(prefix) + '\"')
+parts.append('color:\"' + js_str(color) + '\"')
+parts.append('decoration:true')
+
+with open(out, 'w') as f:
+    f.write('window.__LINKIFIER_CONFIG__={' + ','.join(parts) + '};' + chr(10))
+" "$JS_REGEX" "${URL_TEMPLATE:-null}" "${PATTERN:-}" "$COLOR" "${HOST_DIR}/linkifier-config.js"
+
+ok "Generated: ${HOST_DIR}/linkifier-config.js"
+
+# ── Step 3: Check container volume mounts ───────────────────────────────────
+info "Checking container volume mounts..."
+
+if docker inspect "$CONTAINER" --format '{{json .Mounts}}' 2>/dev/null | grep -q "linkifier.js"; then
+    ok "Volume mounts already present"
+else
+    warn "Container needs recreation with volume mounts"
+    warn "This will briefly stop Termix (active sessions will be lost)"
+
+    IMAGE=$(docker inspect "$CONTAINER" --format '{{.Config.Image}}')
+    RESTART=$(docker inspect "$CONTAINER" --format '{{.HostConfig.RestartPolicy.Name}}')
+
+    PORT_ARGS=$(docker inspect "$CONTAINER" --format '{{json .HostConfig.PortBindings}}' | python3 -c "
+import json, sys
+ports = json.load(sys.stdin)
+args = []
+for cp, binds in ports.items():
+    for b in binds:
+        p = cp.split('/')[0]
+        args.append('-p ' + b.get('HostPort','') + ':' + p)
+print(' '.join(args))
+")
+
+    VOL_ARGS=$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Type "volume"}}-v {{.Name}}:{{.Destination}} {{end}}{{end}}')
+
+    info "Recreating container..."
+    docker stop "$CONTAINER" >/dev/null
+    docker rm "$CONTAINER" >/dev/null
+
+    eval "docker run -d --name ${CONTAINER} --restart ${RESTART} ${PORT_ARGS} ${VOL_ARGS} \
+        -v ${HOST_DIR}/linkifier.js:${HTML_DIR}/assets/linkifier.js:ro \
+        -v ${HOST_DIR}/linkifier-config.js:${HTML_DIR}/assets/linkifier-config.js:ro \
+        ${IMAGE}" >/dev/null
+
+    ok "Container recreated with volume mounts"
+    info "Waiting for startup..."
+    sleep 5
 fi
 
-info "Reloading nginx (no restart needed, sessions preserved)..."
-docker exec "$CONTAINER" sh -c 'kill -HUP $(cat /app/nginx/nginx.pid 2>/dev/null)' 2>&1 || die "nginx reload failed!"
-ok "nginx reloaded"
+# ── Step 4: Patch index.html ───────────────────────────────────────────────
+info "Checking index.html..."
 
-# ── Step 7: Clean up legacy v1 artifacts ────────────────────────────────────
-if docker exec "$CONTAINER" sh -c "[ -f '${HTML_DIR}/assets/index-LINKIFIER.js' ]" 2>/dev/null; then
-    info "Cleaning up legacy v1 bundle patch..."
-    # Restore original index.html if it was pointing to LINKIFIER
-    if docker exec "$CONTAINER" grep -q "index-LINKIFIER" "${HTML_DIR}/index.html" 2>/dev/null; then
-        ORIG_BUNDLE=$(docker exec "$CONTAINER" sh -c "ls ${HTML_DIR}/assets/index-*.js.bak 2>/dev/null | head -1" || true)
-        if [[ -n "$ORIG_BUNDLE" ]]; then
-            ORIG_NAME=$(basename "${ORIG_BUNDLE%.bak}")
-            docker cp "${CONTAINER}:${HTML_DIR}/index.html" "${tmp_dir}/index.html"
-            sed -i -E "s|src=\"\./assets/index-[^\"]+\"|src=\"./assets/${ORIG_NAME}\"|" "${tmp_dir}/index.html"
-            docker cp "${tmp_dir}/index.html" "${CONTAINER}:${HTML_DIR}/index.html"
-            ok "Restored index.html to original bundle: ${ORIG_NAME}"
-        fi
-    fi
-    docker exec -u root "$CONTAINER" rm -f "${HTML_DIR}/assets/index-LINKIFIER.js"
-    ok "Removed legacy index-LINKIFIER.js"
+if docker exec "$CONTAINER" grep -q "linkifier" "${HTML_DIR}/index.html" 2>/dev/null; then
+    ok "Script tags already present in index.html"
+else
+    info "Adding script tags to index.html..."
+    tmp_html=$(mktemp)
+    docker cp "${CONTAINER}:${HTML_DIR}/index.html" "$tmp_html"
+    sed -i 's|</head>|<script src="./assets/linkifier-config.js"></script><script src="./assets/linkifier.js"></script></head>|' "$tmp_html"
+    docker cp "$tmp_html" "${CONTAINER}:${HTML_DIR}/index.html"
+    rm -f "$tmp_html"
+    ok "Script tags added to index.html"
 fi
 
 # ── Done ────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}Installation complete!${NC}"
 echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "  Method:    nginx sub_filter (stable!)"
 echo -e "  Pattern:   ${PATTERN:-"(custom regex)"}"
 echo -e "  Action:    ${URL_TEMPLATE:-"Copy to clipboard"}"
 echo -e "  Color:     ${COLOR}"
-echo -e "  Files:     ${HTML_DIR}/assets/linkifier.js"
-echo -e "             ${HTML_DIR}/assets/linkifier-config.js"
-echo -e "             ${NGINX_CONF} (sub_filter block)"
+echo -e "  Files:     ${HOST_DIR}/linkifier.js (volume mounted)"
+echo -e "             ${HOST_DIR}/linkifier-config.js (volume mounted)"
 echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo -e "  Reload Termix in your browser (Ctrl+Shift+R) to activate."
 echo ""
-echo -e "  To uninstall:"
-echo -e "  ${CYAN}./uninstall.sh --container ${CONTAINER}${NC}"
+echo -e "  ${YELLOW}Note: After a Termix image update, re-run this script"
+echo -e "  to re-add the script tags to the new index.html.${NC}"
 echo ""
