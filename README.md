@@ -2,7 +2,9 @@
 
 Make any text pattern clickable in [Termix](https://github.com/lukegus/termix) and other xterm.js-based web terminals.
 
-Matched patterns get a persistent colored underline and become clickable — opening a URL or copying to clipboard.
+Matched patterns get a colored underline and become clickable — opening a URL or copying to clipboard.
+
+![Screenshot showing clickable file paths in a Termix terminal](https://img.shields.io/badge/v2.1.0-stable-brightgreen)
 
 ## Quick Start
 
@@ -10,40 +12,45 @@ Matched patterns get a persistent colored underline and become clickable — ope
 git clone https://github.com/stlas/termix-linkifier.git
 cd termix-linkifier
 
-# Make /opt/shared/ paths clickable (copies to clipboard)
-./install.sh --container termix --pattern '/opt/shared/'
+# Make /opt/shared/ paths open in a web viewer
+./install.sh --container termix --pattern '/opt/shared/' \
+  --url 'http://viewer.example.com/?file={path}'
 
-# Make /var/log/ paths open in a web viewer
-./install.sh --container termix --pattern '/var/log/' \
-  --url 'http://logviewer.example.com/?file={path}'
+# Or just copy paths to clipboard on click
+./install.sh --container termix --pattern '/var/log/'
 ```
 
 Reload Termix in your browser (`Ctrl+Shift+R`). Done.
 
 ## How It Works
 
-**v2.0** uses nginx `sub_filter` injection — a clean, stable approach that **survives Termix updates**:
+The linkifier runs as a standalone JavaScript file inside Termix — **no bundle patching, no nginx modification**.
 
-1. A standalone `linkifier.js` is deployed to the assets directory
-2. nginx's `sub_filter` injects a `<script>` tag into every HTML response (before `</body>`)
-3. The script discovers xterm.js Terminal instances via DOM observation
-4. It registers a **custom Link Provider** (using xterm.js's official API) that detects your text pattern
-5. **Persistent Decorations** draw colored underlines beneath matched text
+1. `linkifier.js` and `linkifier-config.js` are deployed to the Docker host and **volume-mounted** into the container
+2. Two `<script>` tags are added to `index.html` (before `</head>`)
+3. A **MutationObserver** detects when xterm.js terminals appear in the DOM
+4. A **periodic scanner** (every 1.5s) checks rendered terminal rows for pattern matches
+5. The **Range API** calculates the exact pixel position of matched text
+6. Transparent **overlay elements** are placed on top of matches — clickable, with a colored underline
 
-### Why nginx sub_filter?
+### Version History
 
-| | v1 (Bundle Patching) | v2 (nginx sub_filter) |
-|---|---|---|
-| Survives updates | No — patch is lost | **Yes** — separate file + nginx config |
-| Risk of breakage | **High** — modifies minified JS | None — no bundle modification |
-| Injection method | sed/python on 11MB bundle | nginx injects `<script>` tag |
-| Cleanup | Restore backup bundle | Remove 3 nginx lines |
+| Version | Method | Stability |
+|---------|--------|-----------|
+| v1.0 | Bundle patching (sed on minified JS) | Fragile — breaks on every update |
+| v2.0 | nginx `sub_filter` injection | Unstable — nginx crashes on reload |
+| **v2.1** | **Docker volume mount + index.html** | **Stable** — survives updates |
 
 ### What gets deployed
 
-- `assets/linkifier.js` — standalone script (no dependencies)
-- A `sub_filter` block in `nginx.conf` (between marker comments)
-- Backup of original `nginx.conf` as `nginx.conf.pre-linkifier`
+```
+Host filesystem (/opt/termix-linkifier/):
+  linkifier.js          ← volume-mounted into container (read-only)
+  linkifier-config.js   ← volume-mounted into container (read-only)
+
+Inside container (/app/html/):
+  index.html            ← two <script> tags added before </head>
+```
 
 ## Usage
 
@@ -57,27 +64,26 @@ Reload Termix in your browser (`Ctrl+Shift+R`). Done.
 |--------|-------------|
 | `--pattern TEXT` | Text prefix to match (e.g. `/opt/shared/`, `JIRA-`, `/var/log/`) |
 
-### Click Action
+### Click Action (pick one)
 
 | Option | Description |
 |--------|-------------|
 | `--clipboard` | Copy matched text to clipboard (default) |
-| `--url TEMPLATE` | Open URL on click. Use `{path}` as placeholder for the matched text |
+| `--url TEMPLATE` | Open URL on click. Use `{path}` as placeholder |
 
-### Docker
+### Docker Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--container NAME` | `termix` | Docker container name |
-| `--nginx-conf PATH` | `/app/nginx/nginx.conf` | nginx.conf path inside container |
 | `--html-dir PATH` | `/app/html` | HTML directory inside container |
+| `--host-dir PATH` | `/opt/termix-linkifier` | Host directory for persistent files |
 
 ### Appearance
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--color HEX` | `#4fc3f7` | Color of the persistent underline |
-| `--no-decoration` | | Disable persistent underline (links still work on hover) |
+| `--color HEX` | `#4fc3f7` | Color of the underline and hover highlight |
 
 ### Advanced
 
@@ -117,16 +123,15 @@ Reload Termix in your browser (`Ctrl+Shift+R`). Done.
 
 ## After a Termix Update
 
-With v2.0, **most updates preserve the linkifier automatically**:
-
-- If only the JS bundle changes → linkifier keeps working (it's a separate file)
-- If nginx.conf is regenerated → re-run `install.sh` with the same parameters
+Volume-mounted files (`linkifier.js`, `linkifier-config.js`) persist across updates automatically. Only `index.html` needs to be re-patched after an image update:
 
 ```bash
-# Re-apply after update (if needed)
+# Re-run after docker pull / image update
 ./install.sh --container termix --pattern '/opt/shared/' \
   --url 'http://viewer.example.com/?file={path}'
 ```
+
+The installer detects existing volume mounts and only re-adds the `<script>` tags if missing.
 
 ## Uninstall
 
@@ -134,7 +139,7 @@ With v2.0, **most updates preserve the linkifier automatically**:
 ./uninstall.sh --container termix
 ```
 
-This removes the nginx sub_filter block, deletes `linkifier.js`, and reloads nginx. Also handles legacy v1 bundle patches if present.
+This removes the script tags from `index.html`, deletes the linkifier files, and handles legacy v1/v2.0 artifacts.
 
 ## Compatibility
 
@@ -143,50 +148,61 @@ This removes the nginx sub_filter block, deletes `linkifier.js`, and reloads ngi
 | Termix | 2.0.0 |
 | xterm.js | 5.x (`@xterm/xterm`) |
 | Browser | Chromium-based (Chrome, Brave, Edge) |
-| nginx | With `http_sub_module` (standard in Termix) |
-| Python | 3.6+ |
+| Python | 3.6+ (for config generation) |
 | Bash | 4.0+ |
 | Docker | 20.0+ |
 
-Should work with any web terminal that uses xterm.js and serves HTML via nginx.
+Should work with any web terminal that uses xterm.js and renders text in `.xterm-rows` DOM elements.
 
 ## Technical Details
 
+### Text Detection
+
+The scanner runs every 1.5s and checks all visible terminal rows:
+
+1. Gets `textContent` from each `.xterm-rows > div` element
+2. Fast-path: skips rows that don't contain the prefix pattern
+3. Runs the configured regex against matching rows
+4. Strips trailing punctuation from matches (`.`, `,`, `)`, etc.)
+
+### Pixel-Perfect Positioning with Range API
+
+Previous versions calculated overlay positions using `charWidth * characterIndex` — this broke across different screen sizes, DPI settings, and xterm.js rendering modes (canvas vs DOM).
+
+v2.1 uses the browser's **Range API** instead:
+
+```javascript
+var range = document.createRange();
+range.setStart(textNode, matchStart);
+range.setEnd(textNode, matchEnd);
+var rect = range.getClientRects()[0];  // exact pixel coordinates
+```
+
+This gives pixel-perfect positioning regardless of:
+- Font size, family, or rendering engine
+- Canvas vs DOM renderer
+- Screen DPI / zoom level
+- Multi-monitor setups with different scaling
+
 ### Terminal Discovery
 
-Since Termix bundles xterm.js (it's not loaded as a separate script), the linkifier discovers Terminal instances through multiple strategies:
+A `MutationObserver` watches the document for elements with the `.xterm` CSS class. When found, the scanner begins checking that terminal's rows for pattern matches.
 
-1. **DOM Observation** — a MutationObserver watches for elements with the `xterm` CSS class
-2. **CSS Class Hook** — intercepts `DOMTokenList.add("xterm")` to detect the exact moment a terminal is created
-3. **React Fiber Walking** — traverses the React component tree to find the Terminal instance from DOM elements
+### Overlay Architecture
 
-### Link Provider
+Overlays are transparent `<a>` elements positioned absolutely inside `.xterm-screen`:
 
-Uses xterm.js's official `registerLinkProvider()` API:
+- `pointer-events: auto` makes them clickable
+- `border-bottom: 2px solid <color>` creates the underline
+- Hover effect changes opacity and adds background highlight
+- The overlay container has `overflow: hidden` to clip at terminal edges
 
-- `provideLinks(lineNumber)` receives **1-based** line numbers; `buffer.getLine()` is **0-based**
-- Fast-path: lines without the prefix pattern are skipped immediately
-- Trailing dots are stripped from matches (e.g. `/opt/shared/file.md.` → `/opt/shared/file.md`)
-
-### Decorations
-
-- `registerMarker(offset)` uses `bufferLine - (baseY + cursorY)` as offset
-- Decorations are cached per buffer line and disposed when content changes
-- Old decorations (>200 lines above viewport) are garbage-collected
-
-## Migrating from v1
-
-v2's `install.sh` automatically detects and removes v1 artifacts:
-
-- Restores `index.html` to the original bundle (removes `index-LINKIFIER.js` reference)
-- Deletes the patched `index-LINKIFIER.js` file
-
-No manual migration needed — just run the new `install.sh`.
+Overlays are re-created on every scan cycle to stay in sync with terminal content (scrolling, new output, resize).
 
 ## Requirements
 
-- **Python 3** (for the nginx config patcher)
-- **Docker CLI**
+- **Docker CLI** — to manage the Termix container
+- **Python 3** — for config file generation
 - **Bash 4+**
 
 ## License
