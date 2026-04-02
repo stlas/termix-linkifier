@@ -1,8 +1,8 @@
 # termix-linkifier
 
-Make any text pattern clickable in [Termix](https://github.com/nickadam/termix) and other xterm.js-based web terminals.
+Make any text pattern clickable in [Termix](https://github.com/lukegus/termix) and other xterm.js-based web terminals.
 
-Matched patterns get a persistent colored underline and become clickable -- opening a URL or copying to clipboard.
+Matched patterns get a persistent colored underline and become clickable — opening a URL or copying to clipboard.
 
 ## Quick Start
 
@@ -22,19 +22,28 @@ Reload Termix in your browser (`Ctrl+Shift+R`). Done.
 
 ## How It Works
 
-termix-linkifier patches the minified xterm.js bundle inside your Termix installation to inject:
+**v2.0** uses nginx `sub_filter` injection — a clean, stable approach that **survives Termix updates**:
 
-1. **A custom Link Provider** that detects your text pattern and makes matches clickable
-2. **Persistent Decorations** that draw colored underlines beneath matched text (not just on hover)
-3. **Staleness Detection** that automatically removes decorations when the line content changes
+1. A standalone `linkifier.js` is deployed to the assets directory
+2. nginx's `sub_filter` injects a `<script>` tag into every HTML response (before `</body>`)
+3. The script discovers xterm.js Terminal instances via DOM observation
+4. It registers a **custom Link Provider** (using xterm.js's official API) that detects your text pattern
+5. **Persistent Decorations** draw colored underlines beneath matched text
 
-The patch hooks into xterm.js's `WebLinksAddon.activate()` method -- the same code path that makes `http://` URLs clickable. This ensures correct coordinate handling and native terminal rendering.
+### Why nginx sub_filter?
 
-### What gets modified
+| | v1 (Bundle Patching) | v2 (nginx sub_filter) |
+|---|---|---|
+| Survives updates | No — patch is lost | **Yes** — separate file + nginx config |
+| Risk of breakage | **High** — modifies minified JS | None — no bundle modification |
+| Injection method | sed/python on 11MB bundle | nginx injects `<script>` tag |
+| Cleanup | Restore backup bundle | Remove 3 nginx lines |
 
-- The main JavaScript bundle (e.g. `assets/index-Ddwdsiux.js`) is copied to `index-LINKIFIER.js` with the patch applied
-- `index.html` is updated to load the patched bundle (with a cache-busting query string)
-- The original bundle is backed up as `*.bak` for easy uninstall
+### What gets deployed
+
+- `assets/linkifier.js` — standalone script (no dependencies)
+- A `sub_filter` block in `nginx.conf` (between marker comments)
+- Backup of original `nginx.conf` as `nginx.conf.pre-linkifier`
 
 ## Usage
 
@@ -55,21 +64,13 @@ The patch hooks into xterm.js's `WebLinksAddon.activate()` method -- the same co
 | `--clipboard` | Copy matched text to clipboard (default) |
 | `--url TEMPLATE` | Open URL on click. Use `{path}` as placeholder for the matched text |
 
-### Docker Mode (default)
+### Docker
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--container NAME` | `termix` | Docker container name |
-| `--bundle-dir PATH` | `/app/html/assets` | Asset directory inside container |
-| `--index-html PATH` | `/app/html/index.html` | index.html path inside container |
-
-### Local Mode
-
-| Option | Description |
-|--------|-------------|
-| `--local` | Work directly on filesystem instead of Docker |
-| `--bundle-dir PATH` | Asset directory on local filesystem |
-| `--index-html PATH` | index.html on local filesystem |
+| `--nginx-conf PATH` | `/app/nginx/nginx.conf` | nginx.conf path inside container |
+| `--html-dir PATH` | `/app/html` | HTML directory inside container |
 
 ### Appearance
 
@@ -114,87 +115,79 @@ The patch hooks into xterm.js's `WebLinksAddon.activate()` method -- the same co
   --color '#ef5350'
 ```
 
-### Local installation (no Docker)
-
-```bash
-./install.sh --local \
-  --bundle-dir /srv/termix/html/assets \
-  --index-html /srv/termix/html/index.html \
-  --pattern '/home/' \
-  --clipboard
-```
-
 ## After a Termix Update
 
-When Termix is updated (e.g. via `docker compose pull && docker compose up -d`), the patched bundle is replaced by the new version. Simply re-run `install.sh` with the same parameters:
+With v2.0, **most updates preserve the linkifier automatically**:
+
+- If only the JS bundle changes → linkifier keeps working (it's a separate file)
+- If nginx.conf is regenerated → re-run `install.sh` with the same parameters
 
 ```bash
-# Termix update
-cd /path/to/termix && docker compose pull && docker compose up -d
-
-# Re-apply linkifier (auto-detects new bundle)
+# Re-apply after update (if needed)
 ./install.sh --container termix --pattern '/opt/shared/' \
   --url 'http://viewer.example.com/?file={path}'
 ```
 
-The installer automatically adapts to different xterm.js bundle versions and minification styles -- no manual adjustments needed.
-
 ## Uninstall
 
 ```bash
-# Docker mode
 ./uninstall.sh --container termix
-
-# Local mode
-./uninstall.sh --local --bundle-dir /path/to/assets --index-html /path/to/index.html
 ```
 
-This restores the original bundle from backup and updates `index.html`.
+This removes the nginx sub_filter block, deletes `linkifier.js`, and reloads nginx. Also handles legacy v1 bundle patches if present.
 
 ## Compatibility
 
 | Component | Tested Version |
 |-----------|---------------|
-| Termix | 1.11.0, 1.12.0+ |
-| xterm.js | 5.x (with WebLinksAddon) |
+| Termix | 2.0.0 |
+| xterm.js | 5.x (`@xterm/xterm`) |
 | Browser | Chromium-based (Chrome, Brave, Edge) |
+| nginx | With `http_sub_module` (standard in Termix) |
 | Python | 3.6+ |
 | Bash | 4.0+ |
 | Docker | 20.0+ |
 
-Should work with any web terminal that uses xterm.js with the `@xterm/addon-web-links` package.
-
-## Requirements
-
-- **Python 3** (for the patcher -- available on most systems)
-- **Docker CLI** (for container mode) or direct filesystem access (`--local`)
-- **Bash 4+**
+Should work with any web terminal that uses xterm.js and serves HTML via nginx.
 
 ## Technical Details
 
-The patcher uses a regex to find the WebLinksAddon activation pattern in the minified bundle:
+### Terminal Discovery
 
-```
-this._linkProvider=this._terminal.registerLinkProvider(
-  new s.WebLinkProvider(this._terminal,VAR,this._handler,VAR)
-)}dispose
-```
+Since Termix bundles xterm.js (it's not loaded as a separate script), the linkifier discovers Terminal instances through multiple strategies:
 
-Where `VAR` matches any single-letter minified variable name. This makes the patcher resilient to different minification outputs across xterm.js versions.
+1. **DOM Observation** — a MutationObserver watches for elements with the `xterm` CSS class
+2. **CSS Class Hook** — intercepts `DOMTokenList.add("xterm")` to detect the exact moment a terminal is created
+3. **React Fiber Walking** — traverses the React component tree to find the Terminal instance from DOM elements
 
-It then injects:
-- A custom `registerLinkProvider` call (using xterm.js's native API)
-- Optional `registerDecoration` calls for persistent visual highlighting
-- Staleness detection that disposes decorations when line content changes
+### Link Provider
 
-Key technical insights discovered during development:
+Uses xterm.js's official `registerLinkProvider()` API:
 
-- `provideLinks(lineNumber)` passes **1-based** line numbers, but `buffer.getLine()` expects **0-based** indices
-- xterm.js's built-in `WebLinkProvider` validates matches with `new URL()`, so it only works for actual URLs -- custom patterns need a raw link provider
-- `registerMarker(offset)` requires `bufferLine - (baseY + cursorY)` as the offset parameter
-- `WebLinkProvider.computeLink` internally appends the `g` regex flag, so never pass a regex that already has it
-- Forward slashes in regex patterns must be escaped as `\/` inside JavaScript regex literals
-- Docker containers may run as non-root users -- use `docker cp` instead of `docker exec` for file operations
+- `provideLinks(lineNumber)` receives **1-based** line numbers; `buffer.getLine()` is **0-based**
+- Fast-path: lines without the prefix pattern are skipped immediately
+- Trailing dots are stripped from matches (e.g. `/opt/shared/file.md.` → `/opt/shared/file.md`)
+
+### Decorations
+
+- `registerMarker(offset)` uses `bufferLine - (baseY + cursorY)` as offset
+- Decorations are cached per buffer line and disposed when content changes
+- Old decorations (>200 lines above viewport) are garbage-collected
+
+## Migrating from v1
+
+v2's `install.sh` automatically detects and removes v1 artifacts:
+
+- Restores `index.html` to the original bundle (removes `index-LINKIFIER.js` reference)
+- Deletes the patched `index-LINKIFIER.js` file
+
+No manual migration needed — just run the new `install.sh`.
+
+## Requirements
+
+- **Python 3** (for the nginx config patcher)
+- **Docker CLI**
+- **Bash 4+**
 
 ## License
 
@@ -202,4 +195,4 @@ Public Domain ([The Unlicense](https://unlicense.org)). Use it however you want.
 
 ## Credits
 
-Built by the [RASSELBANDE](https://github.com/stlas) -- a collaborative AI development team.
+Built by the [RASSELBANDE](https://github.com/stlas) — a collaborative AI development team.
