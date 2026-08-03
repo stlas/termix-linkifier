@@ -1,17 +1,20 @@
 // ============================================================================
-// termix-linkifier v2.2.1 — DOM-based Terminal Link Injector
+// termix-linkifier v2.2.2 — DOM-based Terminal Link Injector
 //
 // Scans rendered xterm.js terminal output and makes matching text patterns
 // clickable by adding overlay elements. Works with any xterm.js version
 // without needing access to the Terminal API.
 //
-// v2.2.1:
+// v2.2.2:
 //   - Multi-pattern support (config.patterns[]) alongside legacy single-pattern.
 //   - Multi-line reassembly for wrapped URLs: a URL that hits the right edge and
 //     continues on the next row is rejoined into one clickable/copyable link.
 //     Fixes long `claude login` OAuth URLs truncated by Termix' own handler.
 //   - Click on a URL opens it in a normal browser TAB (not a popup window) AND
 //     copies the full URL to the clipboard (fallback if the open is blocked).
+//   - v2.2.2: overlay swallows the whole mouse sequence (mousedown/mouseup/
+//     click/contextmenu) so Termix' own xterm link handler no longer fires its
+//     truncated "Open Link" popup alongside our tab-open.
 //
 // Configuration is read from window.__LINKIFIER_CONFIG__ (see normalizePatterns).
 //
@@ -191,7 +194,7 @@
   var MAX_WRAP = CFG.maxWrapRows || 10;
 
   console.log(
-    "[termix-linkifier] v2.2.1 loaded — " + PATTERNS.length + " pattern(s): " +
+    "[termix-linkifier] v2.2.2 loaded — " + PATTERNS.length + " pattern(s): " +
     PATTERNS.map(function (p) { return p.name; }).join(", ")
   );
 
@@ -317,9 +320,18 @@
       overlay.addEventListener("mouseleave", function () {
         this.style.opacity = "0.15"; this.style.background = "transparent";
       });
+      // Swallow the WHOLE mouse sequence so Termix' own xterm link handler
+      // (which fires its truncated "Open Link" popup on mousedown/mouseup)
+      // never sees the click. We act on `click` only. (Stefan-Befund 2026-08-03:
+      // Popup kam trotz eigenem Tab-Öffnen → Termix-Handler lief parallel.)
+      function swallow(e) { e.preventDefault(); e.stopPropagation(); if (e.stopImmediatePropagation) e.stopImmediatePropagation(); }
+      overlay.addEventListener("mousedown", swallow);
+      overlay.addEventListener("mouseup", swallow);
+      overlay.addEventListener("auxclick", swallow);
+      overlay.addEventListener("contextmenu", swallow);
       overlay.addEventListener("click", (function (r2) {
         return function (e) {
-          e.preventDefault(); e.stopPropagation();
+          swallow(e);
           activate(PATTERNS[r2.patternIndex], r2.text);
         };
       })(res));
