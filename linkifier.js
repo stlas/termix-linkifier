@@ -1,20 +1,25 @@
 // ============================================================================
-// termix-linkifier v2.2.2 — DOM-based Terminal Link Injector
+// termix-linkifier v2.3.0 — DOM-based Terminal Link Injector
 //
 // Scans rendered xterm.js terminal output and makes matching text patterns
 // clickable by adding overlay elements. Works with any xterm.js version
 // without needing access to the Terminal API.
 //
-// v2.2.2:
+// v2.3.0:
 //   - Multi-pattern support (config.patterns[]) alongside legacy single-pattern.
 //   - Multi-line reassembly for wrapped URLs: a URL that hits the right edge and
 //     continues on the next row is rejoined into one clickable/copyable link.
 //     Fixes long `claude login` OAuth URLs truncated by Termix' own handler.
 //   - Click on a URL opens it in a normal browser TAB (not a popup window) AND
 //     copies the full URL to the clipboard (fallback if the open is blocked).
-//   - v2.2.2: overlay swallows the whole mouse sequence (mousedown/mouseup/
-//     click/contextmenu) so Termix' own xterm link handler no longer fires its
+//   - Overlay swallows the whole mouse sequence (mousedown/mouseup/click/
+//     contextmenu) so Termix' own xterm link handler no longer fires its
 //     truncated "Open Link" popup alongside our tab-open.
+//   - v2.3.0: copy-on-select — releasing the mouse over a terminal selection
+//     writes it to the clipboard (Termix maps both mouse buttons to PASTE and
+//     has no copy; Strg+C is SIGINT). Needs a secure context (clipboard API);
+//     over http via the browser flag unsafely-treat-insecure-origin-as-secure.
+//     Disable with CFG.copyOnSelect = false.
 //
 // Configuration is read from window.__LINKIFIER_CONFIG__ (see normalizePatterns).
 //
@@ -194,7 +199,7 @@
   var MAX_WRAP = CFG.maxWrapRows || 10;
 
   console.log(
-    "[termix-linkifier] v2.2.2 loaded — " + PATTERNS.length + " pattern(s): " +
+    "[termix-linkifier] v2.3.0 loaded — " + PATTERNS.length + " pattern(s): " +
     PATTERNS.map(function (p) { return p.name; }).join(", ")
   );
 
@@ -381,7 +386,43 @@
     scanTimer = setTimeout(scanAllTerminals, 200);
   }
 
+  // ── Copy-on-select ─────────────────────────────────────────────────────────
+  // Termix mappt beide Maustasten auf EINFUEGEN und hat kein Copy-on-select;
+  // `Strg+C` ist im Terminal SIGINT. Ergebnis: markierter Text landete nie in
+  // der Zwischenablage (Stefan 2026-08-03). Wir ruesten es nach: beim Loslassen
+  // der Maus die aktuelle Terminal-Selektion in die Zwischenablage schreiben.
+  // Voraussetzung: Secure Context (navigator.clipboard) — bei Termix ueber http
+  // via Browser-Flag `unsafely-treat-insecure-origin-as-secure` freigeschaltet.
+  // Abschaltbar per CFG.copyOnSelect = false.
+  function initCopyOnSelect() {
+    if (CFG.copyOnSelect === false) return;
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+      console.warn("[termix-linkifier] copy-on-select: Zwischenablage gesperrt " +
+        "(kein Secure Context) — Browser-Flag noetig. Uebersprungen.");
+      return;
+    }
+    // capture:true -> laeuft VOR den Overlay-mouseup-Handlern (die stoppen die
+    // Propagation), damit auch eine Selektion, die auf einem Link endet, kopiert.
+    document.addEventListener("mouseup", function () {
+      setTimeout(function () {
+        var sel = window.getSelection && window.getSelection();
+        if (!sel || sel.isCollapsed) return;
+        var text = sel.toString();
+        if (!text || !text.trim()) return;
+        // Nur Selektionen INNERHALB eines Terminals kopieren (nicht sonstige UI).
+        var n = sel.anchorNode;
+        var el = n ? (n.nodeType === 1 ? n : n.parentElement) : null;
+        if (!el || !el.closest || !el.closest(".xterm")) return;
+        navigator.clipboard.writeText(text).then(function () {
+          showToast("📋 Kopiert (" + text.length + " Zeichen)");
+        }, function () { /* still: Nutzer kann weiter mittlere Taste nutzen */ });
+      }, 0);
+    }, true);
+    console.log("[termix-linkifier] copy-on-select aktiv (markieren = kopieren)");
+  }
+
   function init() {
+    initCopyOnSelect();
     var observer = new MutationObserver(function (mutations) {
       for (var i = 0; i < mutations.length; i++) {
         var target = mutations[i].target;
