@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>termix-linkifier v2.2 — Test</title>
+<style>
+  body { background:#0d1117; color:#c9d1d9; font-family:monospace; padding:20px; }
+  h1 { font-size:15px; color:#81c784; }
+  p  { font-size:13px; color:#8b949e; }
+  /* Minimaler Nachbau der xterm-DOM-Struktur (rows als divs, Zeichen-Zellen). */
+  .xterm { position:relative; display:inline-block; }
+  .xterm-screen { position:relative; }
+  .xterm-rows { font:14px/18px monospace; white-space:pre; }
+  .xterm-rows > div { height:18px; }
+  .box { border:1px solid #30363d; padding:10px; margin:14px 0; background:#010409; }
+</style>
+</head>
+<body>
+  <h1>termix-linkifier v2.2 — Selbst-Test (kein Termix noetig)</h1>
+  <p>Erwartung: Die ueber mehrere Zeilen gewrappte <code>claude login</code>-URL bekommt
+     EINEN durchgehenden gruenen Unterstrich. Klick → oeffnet die volle URL + kopiert sie
+     (Toast unten rechts). Der <code>/opt/shared/</code>-Pfad wird blau.</p>
+
+  <div class="box">
+    <div class="xterm">
+      <div class="xterm-screen">
+        <div class="xterm-rows" id="rows"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Eine realistische, ~450 Zeichen lange OAuth-URL.
+    var URL = "https://claude.ai/oauth/authorize?client_id=9d1e4f7a-2b3c-4d5e-6f70-8a9b0c1d2e3f" +
+      "&response_type=code&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcallback" +
+      "&scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference&code_challenge=" +
+      "dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk" +
+      "&code_challenge_method=S256&state=hKFo2SB1c2VyX2lkX3JhbmRvbV9zdGF0ZV92YWx1ZQ";
+
+    var COLS = 80;
+    function hardWrap(s, cols) {
+      var out = [];
+      for (var i = 0; i < s.length; i += cols) out.push(s.slice(i, i + cols));
+      return out;
+    }
+
+    // Terminal-Ausgabe simulieren: Prompt, gewrappte URL, dann Prompt-Zeile,
+    // plus eine Zeile mit einem /opt/shared/-Pfad.
+    var lines = ["stefan@popos:~$ claude login", ""]
+      .concat(hardWrap(URL, COLS))
+      .concat([
+        "",
+        "Paste code here if prompted > ",
+        "",
+        "log written to /opt/shared/SYNAPSE/INBOX/CODE/last.md"
+      ]);
+
+    var rows = document.getElementById("rows");
+    lines.forEach(function (t) {
+      var d = document.createElement("div");
+      // xterm rendert Zeichen in <span>s; ein span reicht fuer den Test.
+      var span = document.createElement("span");
+      span.textContent = t;
+      d.appendChild(span);
+      rows.appendChild(d);
+    });
+
+    // Config wie im Deployment (beide Patterns).
+    window.__LINKIFIER_CONFIG__ = {
+      patterns: [
+        { name:"opt-shared", regex:"\\/opt\\/shared\\/[^\\s\"'<>)\\]\\}|,;:]+",
+          url:"http://192.168.178.225:5590/?file={path}", prefix:"/opt/shared/",
+          color:"#4fc3f7", multiline:false },
+        { name:"url", regex:"https?:\\/\\/[^\\s]+", url:"{match}",
+          color:"#81c784", multiline:true }
+      ],
+      maxWrapRows: 10
+    };
+  </script>
+  <script src="../linkifier.js"></script>
+</body>
+</html>
