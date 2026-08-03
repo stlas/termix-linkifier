@@ -1,17 +1,17 @@
 // ============================================================================
-// termix-linkifier v2.2.0 — DOM-based Terminal Link Injector
+// termix-linkifier v2.2.1 — DOM-based Terminal Link Injector
 //
 // Scans rendered xterm.js terminal output and makes matching text patterns
 // clickable by adding overlay elements. Works with any xterm.js version
 // without needing access to the Terminal API.
 //
-// v2.2.0:
+// v2.2.1:
 //   - Multi-pattern support (config.patterns[]) alongside legacy single-pattern.
 //   - Multi-line reassembly for wrapped URLs: a URL that hits the right edge and
 //     continues on the next row is rejoined into one clickable/copyable link.
 //     Fixes long `claude login` OAuth URLs truncated by Termix' own handler.
-//   - Click on a URL opens it AND copies the full URL to the clipboard (fallback
-//     when the popup is blocked).
+//   - Click on a URL opens it in a normal browser TAB (not a popup window) AND
+//     copies the full URL to the clipboard (fallback if the open is blocked).
 //
 // Configuration is read from window.__LINKIFIER_CONFIG__ (see normalizePatterns).
 //
@@ -191,19 +191,32 @@
   var MAX_WRAP = CFG.maxWrapRows || 10;
 
   console.log(
-    "[termix-linkifier] v2.2.0 loaded — " + PATTERNS.length + " pattern(s): " +
+    "[termix-linkifier] v2.2.1 loaded — " + PATTERNS.length + " pattern(s): " +
     PATTERNS.map(function (p) { return p.name; }).join(", ")
   );
 
   // ── Activation (click) ────────────────────────────────────────────────────
+  // Open a URL in a normal browser TAB (not a popup window) via a synthetic
+  // anchor click. window.open(..., "noopener") forced a popup WINDOW in many
+  // browsers (Stefan-Befund 2026-08-03); the anchor respects the tab setting
+  // while rel=noopener/noreferrer still prevents tabnabbing.
+  function openInTab(u) {
+    var a = document.createElement("a");
+    a.href = u;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
   function activate(pattern, text) {
     var cleaned = cleanTrail(text);
     if (pattern.url) {
-      var u = resolveUrl(pattern, cleaned);
-      // Open in a new tab; ALSO copy so a blocked popup still leaves the link
-      // in the clipboard (fixes truncated Strg+C on wrapped URLs).
-      var opened = window.open(u, "_blank", "noopener");
-      copy(cleaned, opened ? "Link geöffnet + kopiert" : "Link kopiert (Popup blockiert)");
+      openInTab(resolveUrl(pattern, cleaned));
+      // ALSO copy, so a blocked open still leaves the full link in the
+      // clipboard (also fixes truncated Strg+C on wrapped URLs).
+      copy(cleaned, "Link im Tab geöffnet + kopiert");
     } else {
       copy(cleaned, "Kopiert: " + cleaned);
     }
